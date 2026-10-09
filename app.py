@@ -72,11 +72,22 @@ def clean_header(value) -> str:
 
 
 def _drop_empty_rows_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all").copy()
+    # 不按“数据是否全空”删除有名称的列。FastMoss 可能保留字段名但整列
+    # 数据为空（如 2026-10 的“开始带货时间”）；如果删掉该列，会改变
+    # 用于识别渠道的表头结构。
+    df = df.dropna(axis=0, how="all").copy()
     df.columns = [clean_header(c) for c in df.columns]
-    # 去掉真正的空表头列
-    keep_cols = [c for c in df.columns if c]
-    return df.loc[:, keep_cols]
+    # 只剔除空表头，以及真正无数据的 Excel 占位列 Unnamed: N。
+    # 按位置索引，避免重名表头时 df[col] 返回多列。
+    keep_positions = [
+        idx
+        for idx, col in enumerate(df.columns)
+        if col and not (
+            re.fullmatch(r"Unnamed:\s*\d+", col, flags=re.IGNORECASE)
+            and df.iloc[:, idx].isna().all()
+        )
+    ]
+    return df.iloc[:, keep_positions]
 
 
 @st.cache_data(show_spinner=False)
@@ -177,7 +188,11 @@ def detect_channel(columns: Iterable[str]) -> Optional[str]:
     if {"评论数", "达人ID", "TikTok官网视频主页", "FastMoss视频详情页"}.issubset(headers):
         return "热门视频"
 
-    if {"达人ID", "销量", "销售额", "开始带货时间"}.issubset(headers):
+    # “开始带货时间”可能整列为空，甚至在新版导出中直接缺失。
+    # 用达人身份列 + 两项渠道核心指标识别，避免依赖非必要字段。
+    if {"达人ID", "销量", "销售额"}.issubset(headers) and (
+        {"达人昵称", "达人分类", "粉丝数", "FastMoss达人详情页"} & headers
+    ):
         return "商品关联达人"
 
     return None

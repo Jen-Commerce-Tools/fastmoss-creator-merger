@@ -157,10 +157,14 @@ def normalize_id_display(value) -> str:
         return ""
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
-    return str(value).strip()
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null", "nat", "<na>"}:
+        return ""
+    return text
 
 
 def creator_key(value) -> str:
+    """FastMoss 达人ID匹配键；去空格、@ 前缀，不区分大小写。"""
     text = normalize_id_display(value)
     if not text:
         return ""
@@ -326,7 +330,11 @@ def first_non_empty(series: pd.Series):
 def combine_all_channels(channel_results: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, int]:
     frames = [df for df in channel_results.values() if df is not None and not df.empty]
     if not frames:
-        return pd.DataFrame(), 0
+        # 即使用户把全部渠道行筛选掉，导出仍保留 Excel 表头。
+        source_frames = [df.iloc[:0] for df in channel_results.values() if df is not None]
+        if not source_frames:
+            return pd.DataFrame(columns=["达人ID"]), 0
+        return reorder_columns(pd.concat(source_frames, ignore_index=True, sort=False)), 0
 
     all_rows = pd.concat(frames, ignore_index=True, sort=False)
     if "达人ID" not in all_rows.columns:
@@ -360,46 +368,73 @@ def combine_all_channels(channel_results: Dict[str, pd.DataFrame]) -> Tuple[pd.D
 
 
 # =========================
-# 6. Excel 导出
+# 6. 可选排除名单 & Excel 导出
 # =========================
-def to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
-    output = io.BytesIO()
-    safe_sheet = re.sub(r"[\\/*?:\[\]]", "_", sheet_name)[:31] or "结果"
+def load_exclusion_ids(file_bytes: bytes, filename: str, history: bool = False) -> Tuple[set, int]:
+    """提取外部文件第一张工作表中的达人ID，不读取历史文件的第二张工作表。"""
+    suffix = filename.lower().rsplit(".", 1)[-1]
+    if history:
+        if suffix not in {"xlsx", "xls"}:
+            raise ValueError("历史全渠道汇总必须是双 Sheet Excel 文件（.xlsx / .xls）")
+        engine = "openpyxl" if suffix == "xlsx" else "xlrd"
+        with pd.ExcelFile(io.BytesIO(file_bytes), engine=engine) as book:
+            if len(book.sheet_names) < 2:
+                raise ValueError("历史全渠道汇总需要至少两个 Sheet；仅提取第一个 Sheet 的达人ID")
 
+    # read_table 固定读取第一张 Sheet（索引 0），因此绝不会把 Sheet 2
+    # 的“排除后达人”反向混入排除名单。
+    df = normalize_common_columns(read_table(file_bytes, filename))
+    if "达人ID" not in df.columns:
+        raise ValueError("第一张 Sheet 未找到「达人ID」列，请检查是否上传了正确的文件")
+
+    keys = {key for key in df["达人ID"].map(creator_key) if key}
+    return keys, len(df)
+
+
+def exclude_known_creators(df: pd.DataFrame, excluded_ids: set) -> Tuple[pd.DataFrame, int]:
+    """只从本次完整汇总移除匹配项，不增加或修改源数据列。"""
+    if "达人ID" not in df.columns or df.empty or not excluded_ids:
+        return df.copy(), 0
+    matched = df["达人ID"].map(creator_key).isin(excluded_ids)
+    # 无ID的数据无法判断是否已联系，沿用旧版行为：保留并提示。
+    return df.loc[~matched].copy(), int(matched.sum())
+
+
+def to_workbook_bytes(sheets: List[Tuple[str, pd.DataFrame]]) -> bytes:
+    """写一个或多个 Sheet；保持旧版导出字段与样式。"""
+    output = io.BytesIO()
     with pd.ExcelWriter(
         output,
         engine="xlsxwriter",
         engine_kwargs={"options": {"strings_to_formulas": False, "strings_to_urls": False}},
     ) as writer:
-        df.to_excel(writer, index=False, sheet_name=safe_sheet)
         workbook = writer.book
-        worksheet = writer.sheets[safe_sheet]
-
         header_fmt = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#1F2937",
-                "align": "center",
-                "valign": "vcenter",
-                "border": 0,
-            }
+            {"bold": True, "font_color": "#FFFFFF", "bg_color": "#1F2937",
+             "align": "center", "valign": "vcenter", "border": 0}
         )
-        worksheet.set_row(0, 24, header_fmt)
-        worksheet.freeze_panes(1, 0)
-        if len(df.columns) > 0:
-            worksheet.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
-
-        for idx, col in enumerate(df.columns):
-            sample = df[col].head(200).fillna("").astype(str)
-            max_len = max([len(str(col))] + [len(x) for x in sample])
-            if "链接" in str(col) or "主页" in str(col):
-                width = min(max(max_len + 2, 24), 42)
-            else:
-                width = min(max(max_len + 2, 10), 30)
-            worksheet.set_column(idx, idx, width)
-
+        for raw_sheet_name, df in sheets:
+            sheet_name = re.sub(r"[\\/*?:\[\]]", "_", raw_sheet_name)[:31] or "结果"
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            worksheet = writer.sheets[sheet_name]
+            worksheet.set_row(0, 24, header_fmt)
+            worksheet.freeze_panes(1, 0)
+            if len(df.columns) > 0:
+                worksheet.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+            for idx, col in enumerate(df.columns):
+                sample = df[col].head(200).astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+                max_len = max([len(str(col))] + [len(x) for x in sample])
+                if "链接" in str(col) or "主页" in str(col):
+                    width = min(max(max_len + 2, 24), 42)
+                else:
+                    width = min(max(max_len + 2, 10), 30)
+                worksheet.set_column(idx, idx, width)
     return output.getvalue()
+
+
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    """兼容原来的分渠道单 Sheet 下载函数。"""
+    return to_workbook_bytes([(sheet_name, df)])
 
 
 # =========================
@@ -421,18 +456,76 @@ st.markdown(
 )
 
 st.title("FastMoss 达人合并")
-st.caption("上传表格 → 自动识别渠道 → 可选指标筛选 → 渠道去重 → 全渠道去重")
+st.caption("渠道识别 · 可选筛选 · 达人去重 · 排除近期已处理达人")
 
+st.markdown("#### 1 · 今日 FastMoss 表格")
 uploaded_files = st.file_uploader(
-    "上传 FastMoss 表格",
+    "上传渠道表格",
     type=["xlsx", "xls", "csv"],
     accept_multiple_files=True,
-    help="支持一次上传多个渠道、多个文件。文件仅在当前会话中处理。",
+    key="channel_uploads",
+    help="支持六种渠道混合上传；按表头自动识别，无需手动选渠道。",
 )
 
+with st.expander("2 · 排除已有达人（可选）", expanded=False):
+    left_upload, right_upload = st.columns(2, gap="large")
+    with left_upload:
+        contact_files = st.file_uploader(
+            "单日重点建联达人",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            key="contact_uploads",
+            help="支持多份文件，读取第一张 Sheet 的「达人ID」。",
+        )
+    with right_upload:
+        history_file = st.file_uploader(
+            "近期全渠道汇总",
+            type=["xlsx", "xls"],
+            accept_multiple_files=False,
+            key="history_upload",
+            help="双 Sheet 版本；仅提取 Sheet 1 的「达人ID」，不读取 Sheet 2。",
+        )
+    st.caption("排除表格只用于生成新增候选名单，不影响原六渠道结果或完整全渠道汇总。")
+
 if not uploaded_files:
-    st.info("请上传一个或多个 FastMoss 导出表格。")
+    st.info("请先上传 FastMoss 渠道表格。")
     st.stop()
+
+# 先检查排除文件；失败时明确提示，不能悄悄忽略而输出错误的候选名单。
+using_exclusions = bool(contact_files) or history_file is not None
+contact_ids = set()
+history_ids = set()
+exclusion_errors = []
+contact_rows = 0
+history_rows = 0
+
+for item in contact_files or []:
+    try:
+        keys, row_count = load_exclusion_ids(item.getvalue(), item.name)
+        contact_ids.update(keys)
+        contact_rows += row_count
+    except Exception as exc:
+        exclusion_errors.append(f"重点建联文件 {item.name}：{exc}")
+
+if history_file is not None:
+    try:
+        history_ids, history_rows = load_exclusion_ids(
+            history_file.getvalue(), history_file.name, history=True
+        )
+    except Exception as exc:
+        exclusion_errors.append(f"历史汇总文件 {history_file.name}：{exc}")
+
+excluded_ids = contact_ids | history_ids
+if using_exclusions:
+    st.caption(
+        f"排除名单：重点建联 {len(contact_ids):,} 人"
+        f" · 近期汇总 {len(history_ids):,} 人"
+        f" · 合并去重 {len(excluded_ids):,} 人"
+    )
+    if (contact_files and contact_rows and not contact_ids) or (history_file and history_rows and not history_ids):
+        st.warning("某份排除文件没有有效达人ID，请检查内容是否正确。")
+    for error in exclusion_errors:
+        st.error(error)
 
 channel_files = defaultdict(list)
 recognition_rows = []
@@ -456,6 +549,9 @@ for uploaded in uploaded_files:
         recognition_rows.append({"文件": uploaded.name, "渠道": "读取失败", "数据行": "-"})
 
 # 顶部概览
+if not channel_files:
+    st.warning("目前没有可识别的 FastMoss 渠道文件，请检查上传区和表头。")
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("上传文件", len(uploaded_files))
 c2.metric("识别渠道", len(channel_files))
@@ -559,31 +655,64 @@ if channel_results:
         st.subheader("全渠道达人")
         all_result, all_missing_id = combine_all_channels(channel_results)
         before_cross_dedupe = sum(len(df) for df in channel_results.values())
+        remaining, excluded_count = exclude_known_creators(all_result, excluded_ids)
 
-        a1, a2, a3 = st.columns(3)
-        a1.metric("已纳入渠道", len(channel_results))
-        a2.metric("渠道去重达人合计", f"{before_cross_dedupe:,}")
-        a3.metric("全渠道去重后", f"{len(all_result):,}")
+        if using_exclusions:
+            a1, a2, a3 = st.columns(3)
+            a1.metric("本次全渠道去重", f"{len(all_result):,}")
+            a2.metric("排除已处理", f"{excluded_count:,}")
+            a3.metric("剩余候选达人", f"{len(remaining):,}")
+            st.caption(
+                f"已纳入 {len(channel_results)} 个渠道 · 渠道内去重合计 {before_cross_dedupe:,} 条"
+            )
+        else:
+            a1, a2, a3 = st.columns(3)
+            a1.metric("已纳入渠道", len(channel_results))
+            a2.metric("渠道去重达人合计", f"{before_cross_dedupe:,}")
+            a3.metric("全渠道去重后", f"{len(all_result):,}")
 
         if all_missing_id:
-            st.warning(f"全渠道结果中有 {all_missing_id} 条记录缺少达人ID，无法跨渠道去重，已原样保留。")
+            st.warning(f"有 {all_missing_id} 条记录缺少达人ID，无法按ID去重或排除，已保留。")
 
         preview_cols = [
-            c
-            for c in ["达人ID", "达人昵称", "粉丝数", "来源渠道", "来源文件"]
+            c for c in ["达人ID", "达人昵称", "粉丝数", "来源渠道", "来源文件"]
             if c in all_result.columns
         ]
+        if using_exclusions:
+            preview_mode = st.radio(
+                "数据预览", ["Sheet 2 · 排除后达人", "Sheet 1 · 全渠道达人"],
+                horizontal=True, key="all_preview_mode",
+            )
+            preview_df = remaining if preview_mode.startswith("Sheet 2") else all_result
+        else:
+            preview_df = all_result
+
         st.dataframe(
-            all_result.loc[:, preview_cols].head(100) if preview_cols else all_result.head(100),
+            preview_df.loc[:, preview_cols].head(100) if preview_cols else preview_df.head(100),
             use_container_width=True,
             hide_index=True,
             height=360,
         )
 
-        st.download_button(
-            "下载全渠道结果",
-            data=to_excel_bytes(all_result, "全渠道达人"),
-            file_name="全渠道达人_去重结果.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+        if exclusion_errors:
+            st.error("排除文件读取失败：请修正或移除错误文件后再下载全渠道结果，避免漏排除。")
+        else:
+            if using_exclusions:
+                data = to_workbook_bytes([
+                    ("全渠道达人", all_result),
+                    ("排除后达人", remaining),
+                ])
+                file_name = "全渠道达人_排除已处理.xlsx"
+                button_label = "下载全渠道结果（双 Sheet）"
+            else:
+                data = to_excel_bytes(all_result, "全渠道达人")
+                file_name = "全渠道达人_去重结果.xlsx"
+                button_label = "下载全渠道结果"
+            st.download_button(
+                button_label,
+                data=data,
+                file_name=file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="all_channels_download",
+            )

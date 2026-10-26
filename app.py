@@ -139,10 +139,10 @@ def normalize_common_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     alias_map = {
         "达人ID": ["发布达人ID"],
-        "粉丝数": ["达人粉丝数"],
+        "粉丝数": ["达人粉丝数", "粉丝总量"],
         "国家/地区": ["国家"],
         "FastMoss达人详情页": ["FastMoss达人详情页链接", "达人FastMoss详情页链接"],
-        "TikTok官网达人主页": ["TikTok官网达人主页链接", "达人TikTok主页链接"],
+        "TikTok官网达人主页": ["TikTok官网达人主页链接", "达人TikTok主页链接", "Tiktok达人详情"],
     }
     for canonical, aliases in alias_map.items():
         df = coalesce_alias(df, canonical, aliases)
@@ -183,7 +183,13 @@ def detect_channel(columns: Iterable[str]) -> Optional[str]:
     if {"[天]带货销量", "[天]带货销售额", "此店铺商品数"}.issubset(headers):
         return "竞品店铺带货达人"
 
+    # 黑马达人榜旧版：带货潜力指数_20260901 等导出格式。
     if "带货潜力指数" in headers and {"带货总GMV", "视频带货GMV", "直播带货GMV"}.issubset(headers):
+        return "黑马达人榜"
+
+    # 黑马达人榜新版：达人搜索_20261026 等导出格式（经业务确认属黑马来源）。
+    # 用多个同时存在的带货特征字段匹配，避免仅凭文件名或单一“达人ID”误判。
+    if {"达人ID", "带货倾向", "近28天销量", "近28天视频带货销量", "近28天直播带货销量"}.issubset(headers):
         return "黑马达人榜"
 
     if "带货商品数" in headers and {"带货总GMV", "视频带货GMV", "直播带货GMV"}.issubset(headers):
